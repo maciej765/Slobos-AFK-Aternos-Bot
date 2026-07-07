@@ -16,6 +16,92 @@ const app = express();
 app.use(express.json());
 const PORT = process.env.PORT || 5000;
 
+// ── Auth middleware for control endpoints ──────────────────
+// Uses SESSION_SECRET as a shared bearer token.
+const CONTROL_SECRET = process.env.SESSION_SECRET || "";
+
+// Parse cookies from the Cookie header (no external dependency needed)
+function parseCookies(req) {
+  const list = {};
+  const header = req.headers.cookie || "";
+  header.split(";").forEach((pair) => {
+    const idx = pair.indexOf("=");
+    if (idx < 0) return;
+    const key = pair.slice(0, idx).trim();
+    const val = decodeURIComponent(pair.slice(idx + 1).trim());
+    list[key] = val;
+  });
+  return list;
+}
+
+// Middleware: require a valid HttpOnly session cookie — secret never touches the client
+function requireAuth(req, res, next) {
+  if (!CONTROL_SECRET) {
+    return res.status(503).json({ success: false, msg: "Control disabled: SESSION_SECRET not set." });
+  }
+  const cookies = parseCookies(req);
+  if (cookies["bot_session"] !== CONTROL_SECRET) {
+    return res.status(401).json({ success: false, msg: "Unauthorized. Please log in at /login." });
+  }
+  next();
+}
+
+// Login page (GET)
+app.get("/login", (req, res) => {
+  res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Bot Login</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    body { font-family: -apple-system, sans-serif; background: #0d1117; color: #e6edf3;
+           display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }
+    form { background: #161b22; border: 1px solid #30363d; border-radius: 12px;
+           padding: 32px; width: 320px; }
+    h1 { margin: 0 0 20px; font-size: 20px; }
+    label { display: block; font-size: 13px; color: #8b949e; margin-bottom: 6px; }
+    input { width: 100%; padding: 10px 12px; background: #0d1117; border: 1px solid #30363d;
+            border-radius: 6px; color: #e6edf3; font-size: 14px; outline: none; }
+    input:focus { border-color: #58a6ff; }
+    button { margin-top: 16px; width: 100%; padding: 10px; background: #238636;
+             border: none; border-radius: 6px; color: #fff; font-size: 14px;
+             font-weight: 600; cursor: pointer; }
+    button:hover { background: #2ea043; }
+    .err { margin-top: 12px; color: #f85149; font-size: 13px; display: none; }
+  </style>
+</head>
+<body>
+  <form method="POST" action="/login">
+    <h1>🤖 Bot Control Login</h1>
+    <label for="pwd">Control password</label>
+    <input id="pwd" name="password" type="password" autocomplete="current-password" required>
+    <button type="submit">Log in</button>
+    ${req.query.err ? '<p class="err" style="display:block">Incorrect password.</p>' : ''}
+  </form>
+</body>
+</html>`);
+});
+
+// Login (POST) — validate password, set HttpOnly cookie, redirect to dashboard
+app.post("/login", express.urlencoded({ extended: false }), (req, res) => {
+  const pwd = (req.body.password || "").trim();
+  if (!CONTROL_SECRET || pwd !== CONTROL_SECRET) {
+    return res.redirect("/login?err=1");
+  }
+  res.setHeader("Set-Cookie",
+    `bot_session=${encodeURIComponent(CONTROL_SECRET)}; HttpOnly; SameSite=Strict; Path=/`
+  );
+  res.redirect("/");
+});
+
+// Logout
+app.post("/logout", (req, res) => {
+  res.setHeader("Set-Cookie", "bot_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0");
+  res.redirect("/login");
+});
+
 // Bot state tracking
 let botState = {
   connected: false,
@@ -245,6 +331,7 @@ app.get('/', (req, res) => {
 
           async function startBot() {
             const r = await fetch('/start', { method: 'POST' });
+            if (r.status === 401) { window.location='/login'; return; }
             const data = await r.json();
             alert(data.success ? 'Bot started!' : data.msg);
             update();
@@ -252,6 +339,7 @@ app.get('/', (req, res) => {
 
           async function stopBot() {
             const r = await fetch('/stop', { method: 'POST' });
+            if (r.status === 401) { window.location='/login'; return; }
             const data = await r.json();
             alert(data.success ? 'Bot stopped!' : data.msg);
             update();
@@ -930,8 +1018,12 @@ app.get("/logs", (req, res) => {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ command: cmd })
               })
-              .then(function(r) { return r.json(); })
+              .then(function(r) {
+                if (r.status === 401) { window.location = '/login'; return null; }
+                return r.json();
+              })
               .then(function(data) {
+                if (!data) return;
                 if (data.msg) {
                   data.msg.split('\\n').forEach(function(line) {
                     appendLocalEntry(line, data.success ? 'default' : 'error');
@@ -975,7 +1067,7 @@ app.get("/logs", (req, res) => {
 
 let botRunning = true;
 
-app.post("/start", (req, res) => {
+app.post("/start", requireAuth, (req, res) => {
   if (botRunning) return res.json({ success: false, msg: "Already running" });
 
   botRunning = true;
@@ -985,13 +1077,17 @@ app.post("/start", (req, res) => {
   res.json({ success: true });
 });
 
-app.post("/stop", (req, res) => {
+app.post("/stop", requireAuth, (req, res) => {
   if (!botRunning) return res.json({ success: false, msg: "Already stopped" });
 
   botRunning = false;
 
+  // Cancel any pending reconnect so stop is authoritative
+  clearBotTimeouts();
+  isReconnecting = false;
+
   if (bot) {
-    bot.end();
+    try { bot.end(); } catch (_) {}
     bot = null;
   }
 
@@ -1001,7 +1097,7 @@ app.post("/stop", (req, res) => {
   res.json({ success: true });
 });
 
-app.post("/command", express.json(), (req, res) => {
+app.post("/command", requireAuth, express.json(), (req, res) => {
   const cmd = (req.body.command || "").trim();
   if (!cmd) return res.json({ success: false, msg: "Empty command." });
 
@@ -1213,8 +1309,8 @@ function createBot() {
         ? config.server.version
         : false;
     bot = mineflayer.createBot({
-      username: config["bot-account"].username,
-      password: config["bot-account"].password || undefined,
+      username: process.env.BOT_USERNAME || config["bot-account"].username,
+      password: process.env.BOT_PASSWORD || config["bot-account"].password || undefined,
       auth: config["bot-account"].type,
       host: config.server.ip,
       port: config.server.port,
@@ -1368,6 +1464,12 @@ function createBot() {
 }
 
 function scheduleReconnect() {
+  // Don't reconnect if the user explicitly stopped the bot
+  if (!botRunning) {
+    addLog("[Bot] Reconnect suppressed — bot was stopped.");
+    return;
+  }
+
   clearBotTimeouts();
 
   // FIX: don't stack reconnect if already waiting
@@ -1387,7 +1489,7 @@ function scheduleReconnect() {
   reconnectTimeoutId = setTimeout(() => {
     reconnectTimeoutId = null;
     isReconnecting = false;
-    createBot();
+    if (botRunning) createBot();
   }, delay);
 }
 
@@ -1399,7 +1501,7 @@ function initializeModules(bot, mcData, defaultMove) {
 
   // ---------- AUTO AUTH (REACTIVE) ----------
   if (config.utils["auto-auth"] && config.utils["auto-auth"].enabled) {
-    const password = config.utils["auto-auth"].password;
+    const password = process.env.AUTO_AUTH_PASSWORD || config.utils["auto-auth"].password;
     let authHandled = false;
 
     const tryAuth = (type) => {
